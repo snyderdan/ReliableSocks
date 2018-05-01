@@ -20,6 +20,8 @@ import os
 import signal
 
 # The first byte of every packet must have this value
+from collections import deque
+
 MESSAGE_TYPE = 0x44
 
 # this defines the sock352 packet format.
@@ -54,8 +56,7 @@ STATE_REMOTE_CLOSED = 8
 def dbg_print(level, string):
     global sock352_dbg_level
     if (sock352_dbg_level >= level):
-        print
-        string
+        print string
     return
 
 
@@ -81,7 +82,7 @@ class sock352Thread(threading.Thread):
 # is removed from the list of outstanding packets.
 
 def scan_for_timeouts(delay):
-    global list_of_outstanding_packets:
+    global list_of_outstanding_packets
 
     time.sleep(delay)
 
@@ -101,13 +102,14 @@ def scan_for_timeouts(delay):
                 # your transmit code here ...
 
 
-return
+    return
 
 
 # This class holds the data of a packet gets sent over the channel
 #
 class Packet:
     def __init__(self):
+        self.sender = None
         self.type = MESSAGE_TYPE  # ID of sock352 packet
         self.cntl = 0  # control bits/flags
         self.seq = 0  # sequence number
@@ -119,7 +121,7 @@ class Packet:
     def unpack(self, bytes):
         # check that the data length is at least the size of a packet header
         data_len = (len(bytes) - st.calcsize('!bbLLH'))
-        if (data_len >= 0):
+        if data_len >= 0:
             new_format = HEADER_FMT + str(data_len) + 's'
             values = st.unpack(new_format, bytes)
             self.type = values[0]
@@ -172,6 +174,65 @@ class Packet:
         return retstr
 
 
+class Receiver(threading.Thread):
+    """This class is designed to return packets in order. It also processes ACKs and removes them from the
+    outstanding list. It does not, however, handle syncs or FIN packets."""
+    def __init__(self, connection, outstanding):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.packet_queue = deque()
+        self.connection = connection
+        self.next_seq = 0
+        self.running = False
+        self.outstanding = outstanding
+
+    def get_packet(self):
+        packet = None
+        while len(self.packet_queue) == 0:
+            # sleep 50ms waiting for a packet
+            time.sleep(0.05)
+
+        # now we know we have at least 1 valid packet received
+        while self.packet_queue[0].seq != self.next_seq:
+            # wait until we find the packet we're looking for
+            time.sleep(0.05)
+
+        packet = self.packet_queue.popleft()
+        self.next_seq = packet.seq + 1
+        return packet.data
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        self.running = True
+        while self.running:
+            raw_data, address = self.connection.recvfrom(MAX_PKT)
+            packet = Packet()
+            packet.sender = address
+            packet.unpack(raw_data)
+            # if the packet is an ACK
+            if packet.cntl == ACK:
+                # remove the outstanding packet from the outstanding set
+                self.outstanding.remove(packet.ack)
+                continue
+            # if it was not an ACK it must be a data or a FIN packet -- these are processed by the socket
+            if len(self.packet_queue) == 0 or self.packet_queue[-1].seq < packet.seq:
+                # if this packet belongs at the end, place it there
+                self.packet_queue.append(packet)
+            else:
+                i = 0
+                # otherwise, we must iterate through the list to find the correct index
+                for i in range(len(self.packet_queue)):
+                    # find packet with a greater sequence number -- we need to go before that one
+                    if self.packet_queue[i].seq > packet.seq:
+                        break
+                # do insertion
+                self.packet_queue.insert(i, packet)
+            # send ACK packet
+
+
+
 # the main socket class
 # you must fill in all the methods
 # it must work against the class client and servers
@@ -180,16 +241,21 @@ class Packet:
 class Socket:
     def __init__(self):
         # ... your code here ...
-        pass
-
-        # Print a debugging statement line
+        self.socket = None
+        self.debug_level = 0
+        self.drop_prob = 0
+        self.target_address = None
+        self.outstanding = set()
+        self.sequence = random.randint(0, 10000)
+        self.seed = None
+        self.receiver = None
 
     #
     # 0 == no debugging, greater numbers are more detail.
     # You do not need to implement the body of this method,
     # but it must be in the library.
     def set_debug_level(self, level):
-        pass
+        self.debug_level = level
 
         # Set the % likelihood to drop a packet
 
@@ -197,7 +263,7 @@ class Socket:
     # you do not need to implement the body of this method,
     # but it must be in the library,
     def set_drop_prob(self, probability):
-        pass
+        self.drop_prob = probability
 
         # Set the seed for the random number generator to get
 
@@ -206,68 +272,99 @@ class Socket:
     # You do not need to implement the body of this method,
     # but it must be in the library.
     def set_random_seed(self, seed):
-        self.random_seed = seed
+        self.seed = seed
+        random.seed(seed)
 
-
-        # bind the address to a port
-
-    # You must implement this method
-    #
     def bind(self, address):
-        # ... your code here ...
-        pass
-
-        # connect to a remote port
+        # AF_INET is for internet, and SOCK_DGRAM indicates UDP
+        self.socket = ip.socket(ip.AF_INET, ip.SOCK_DGRAM)
+        self.receiver = Receiver(self.socket, self.outstanding)
+        self.socket.bind(address)
 
     # You must implement this method
     def connect(self, address):
-        # ... your code here ...
-        pass
+        self.target_address = address
+        self.socket = ip.socket(ip.AF_INET, ip.SOCK_DGRAM)
+        syncpack = Packet()
+        syncpack.cntl = SYN
+        syncpack.seq = self.sequence
+        self.socket.sendto(syncpack.pack(), address)
+        self.sequence += 1
+        # now we must wait for a response
+        raw_data, address = self.socket.recvfrom(MAX_PKT)
+        packet = Packet()
+        packet.sender = address
+        packet.unpack(raw_data)
+        if packet.cntl != (SYN | ACK):
+            raise RuntimeError("Did not receive an acknowledgement to SYNC packet")
 
-
-        # accept a connection
+        self.receiver = Receiver(self.socket, self.outstanding)
+        self.receiver.next_seq = packet.seq + 1
+        self.receiver.start()
 
     def accept(self):
-        # ... your code here ...
-        pass
+        # do some nonsense to get the address, then start the receiver
+        raw_data, address = self.socket.recvfrom(MAX_PKT)
+        self.target_address = address
+        packet = Packet()
+        packet.sender = address
+        packet.unpack(raw_data)
+        if packet.cntl != SYN:
+            raise RuntimeError("Did not receive SYN packet upon opening connection")
+
+        # received sync, acknowledge and respond
+        ackpack = Packet()
+        ackpack.cntl = ACK | SYN
+        ackpack.seq = self.sequence
+        ackpack.ack = packet.seq
+        self.socket.sendto(ackpack.pack(), self.target_address)
+        # start receiver now that we have an address and a sequence number to start
+        self.sequence += 1
+        self.receiver.next_seq = packet.seq + 1
+        self.receiver.start()
+        return address
 
         # send a message up to MAX_DATA
 
     # You must implement this method
     def sendto(self, buffer):
-        # ... your code here ...
-        pass
+        # so...what if no one implements dropping packets?
+        # read: someone's not going to implement dropping packets
+        if random.random() > self.drop_prob:
+            packet = Packet()
+            packet.cntl = DATA
+            packet.seq = self.sequence
+            packet.data = buffer
+            self.sequence += 1
+            self.outstanding.add(packet)
+            self.socket.sendto(packet.pack(), self.target_address)
 
         # receive a message up to MAX_DATA
 
     # You must implement this method
     def recvfrom(self, nbytes):
+        return self.receiver.get_packet()
 
-
-# ... your code here ...
-[]\0\        pass
-
-
-# close the socket and make sure all outstanding
-# data is delivered
-# You must implement this method
-def close(self):
-    # ... your code here ...
-    pass
+    # close the socket and make sure all outstanding
+    # data is delivered
+    # You must implement this method
+    def close(self):
+        self.socket.close()
+        self.receiver.stop()
 
 
 # Example how to start a start the timeout thread
-global sock352_dbg_level
 sock352_dbg_level = 0
-dbg_print(3, "starting timeout thread")
-
-# create the thread
-thread1 = sock352Thread(1, "Thread-1", 0.25)
-
-# you must make it a daemon thread so that the thread will
-# exit when the main thread does.
-thread1.daemon = True
-
-# run the thread
-thread1.start()
+#
+# dbg_print(3, "starting timeout thread")
+#
+# # create the thread
+# thread1 = sock352Thread(1, "Thread-1", 0.25)
+#
+# # you must make it a daemon thread so that the thread will
+# # exit when the main thread does.
+# thread1.daemon = True
+#
+# # run the thread
+# thread1.start()
 

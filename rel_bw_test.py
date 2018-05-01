@@ -122,16 +122,14 @@ def main():
             mdhash_sent.update(send_data)
             i = i + 1
             if ((i % 100) == 0):
-                print
-                ".",
+                print ".",
 
         if (bytes_to_receive > 0):
             recv_data = s.recvfrom(max_pkt_size)
             bytes_to_receive = bytes_to_receive - len(recv_data)
             mdhash_recv.update(recv_data)
 
-    print
-    " "
+    print " "
     digest_sent = mdhash_sent.digest()
     digest_recv = mdhash_recv.digest()
 
@@ -143,8 +141,7 @@ def main():
     lapsed_seconds = float(end_stamp - start_stamp)
     fd.close()
 
-    print
-    "rel: sent digest: x%s received digest x%s remote digest x%s " % (
+    print "rel: sent digest: x%s received digest x%s remote digest x%s " % (
     binascii.hexlify(digest_sent), binascii.hexlify(digest_recv), binascii.hexlify(remote_digest))
 
     # this part send the lenght of the digest, then the

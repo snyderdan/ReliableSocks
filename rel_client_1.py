@@ -84,8 +84,7 @@ def main():
     for line in lines:
         start_stamp = time.clock()
         if (debug_level > 0):
-            print
-            "rel_client -- sending line %d: %s" % (line_number, line)
+            print "rel_client -- sending line %d: %s" % (line_number, line)
         send = s.sendto(line)
         recv_data = s.recvfrom(len(line))
         end_stamp = time.clock()
@@ -116,12 +115,12 @@ def main():
           (len(lines), total_time * 1000, rtt_min * 1000, rtt_max * 1000, rtt_ave * 1000))
 
     # compare the two digests, byte for byte
-    failed = False;
+    failed = False
     for i, sent_byte in enumerate(digest_sent):
         recv_byte = digest_recv[i]
         if (sent_byte != recv_byte):
             print("rel_client: digest failed at byte %d diff: %c %c " % (i, sent_byte, recv_byte))
-            failed = True;
+            failed = True
     if (not failed):
         print("echo_client: digest succeeded")
 
