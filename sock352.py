@@ -101,7 +101,7 @@ class Packet:
             bytes = st.pack('!bbLLH', self.type, self.cntl, self.seq, self.ack, self.size)
         else:
             new_format = HEADER_FMT + str(data_len) + 's'  # create a new string '!bbLLH30s'
-            dbg_print(5, (
+            dbg_print(10, (
             "cs352 pack: %d %d %d %d %d %s " % (self.type, self.cntl, self.seq, self.ack, self.size, self.data)))
             bytes = st.pack(new_format, self.type, self.cntl, self.seq, self.ack, self.size, self.data)
         return bytes
@@ -153,6 +153,7 @@ class Receiver(threading.Thread):
         self.outstanding = outstanding
         self.timediffs = timediffs
         self.dropprob = dropprob
+        self.received_seqs = set()
 
     def get_packet(self):
         while len(self.packet_queue) == 0 or self.packet_queue[0].seq != self.next_seq:
@@ -163,8 +164,6 @@ class Receiver(threading.Thread):
         return heapq.heappop(self.packet_queue)
 
     def stop(self):
-        while len(self.outstanding) > 0:
-            pass
         self.running = False
 
     def run(self):
@@ -174,27 +173,27 @@ class Receiver(threading.Thread):
             packet = Packet()
             packet.sender = address
             packet.unpack(raw_data)
-            dbg_print(10, "Got %d" % packet.seq)
             # if the packet is an ACK
             if packet.cntl == ACK:
                 # remove the outstanding packet from outstanding and log time to acknowledgement
-                outstanding_lock.acquire()
                 try:
                     acked = self.outstanding.pop(packet.ack)
+                    dbg_print(9, "Got ACK for %x" % packet.ack)
                     self.timediffs.append(time.clock() - acked.time_sent)
                 except Exception:
                     # do nothing if we already got an ACK for this packet
-                    pass
-                outstanding_lock.release()
+                    dbg_print(9, "duplicate ACK for %x" % packet.ack)
             # must be a DATA or FIN packet -- processed by socket
             else:
+                dbg_print(9, "Got %x" % packet.seq)
                 if packet.cntl == DATA:
                     dbg_print(10, "Got data in packet: %s" % packet.data)
-                if packet.seq >= self.next_seq:
+                if packet.seq not in self.received_seqs:
                     # push packet onto heap unless we have already processed the packet
                     heapq.heappush(self.packet_queue, packet)
+                    self.received_seqs.add(packet.seq)
                 else:
-                    print("Already saw: %d" % packet.seq)
+                    dbg_print(9, "Already saw: %x" % packet.seq)
 
                 # send ack packet for the received packet, even if we've seen it already
                 # they may not have gotten the last ACK for it.
@@ -203,6 +202,8 @@ class Receiver(threading.Thread):
                     ackpack.cntl = ACK
                     ackpack.ack = packet.seq
                     self.connection.sendto(ackpack.pack(), address)
+                else:
+                    dbg_print(9, "Dropping ACK for %x" % packet.seq)
 
 
 class Retransmitter(threading.Thread):
@@ -224,19 +225,26 @@ class Retransmitter(threading.Thread):
         while self.running:
             # run every 20ms
             time.sleep(0.02)
+            threshold = 1  # default threshold of 1s
             cnt = len(self.timediffs)
-            if cnt == 0:
+            if cnt == 0 and len(self.outstanding) == 0:
                 continue
+            elif cnt != 0:
+                # if there is previous data to base off of
+                avg = sum(self.timediffs[:cnt]) / cnt
+                # make threshold 10 times the average
+                threshold = 10 * avg
 
-            avg = sum(self.timediffs[:cnt]) / cnt
-            outstanding_lock.acquire()
             for pkt in self.outstanding.values():
-                if (time.clock() - pkt.time_sent) > 10 * avg:
-                    # resend packet if it's 10 times above average for ACKs
+                if (time.clock() - pkt.time_sent) > threshold:
+                    # resend packet if it's above threshold
                     pkt.time_sent = time.clock()
-                    print("sending %d again to %s" % (pkt.seq, str(self.address)))
-                    self.connection.sendto(pkt.pack(), self.address)
-            outstanding_lock.release()
+                    if random.random() > self.dropprob:
+                        dbg_print(9, "sending %x again to %s" % (pkt.seq, str(self.address)))
+                        self.connection.sendto(pkt.pack(), self.address)
+                    else:
+                        dbg_print(9, "Dropping packet again for %x" % pkt.seq)
+        print('exiting')
 
 
 class Socket:
@@ -359,9 +367,11 @@ class Socket:
         self.outstanding[packet.seq] = packet
         # so...what if no one implements dropping packets?
         if random.random() > self.drop_prob:
-            dbg_print(10, "Sending %d" % packet.seq)
+            dbg_print(9, "Sending %x" % packet.seq)
             # actually send packet
             self.socket.sendto(packet.pack(), self.target_address)
+        else:
+            dbg_print(9, "Dropping %x" % packet.seq)
 
     def recvfrom(self, nbytes):
         if len(self.data_buffer):
@@ -381,18 +391,38 @@ class Socket:
                     self.data_buffer += remaining
                 return data
             elif packet.cntl == FIN:
-                pass
+                self.close(packet)
+                return ""
             else:
                 raise RuntimeError("Bad packet control byte: 0x%X" % packet.cntl)
-
 
     # close the socket and make sure all outstanding
     # data is delivered
     # You must implement this method
-    def close(self):
-        self.receiver.stop()
-        self.retransmitter.stop()
-        self.socket.close()
+    def close(self, pkt=None):
+        while len(self.outstanding) > 0:
+            pass
+
+        flags = FIN | (ACK if pkt is not None else 0)
+
+        # create FIN packet
+        finpack = Packet()
+        finpack.seq = self.next_sequence()
+        finpack.cntl = flags
+        # transmit to other end
+        self.socket.sendto(finpack.pack(), self.target_address)
+        dbg_print(8, "Finish packet seq: %x" % finpack.cntl)
+
+        if pkt is None:
+            # wait for response if we are initiating
+            response = self.receiver.get_packet()
+            dbg_print(8, "Received seq: %x cntl: %x" %(response.seq, response.cntl))
+            if response.cntl & FIN:
+                self.receiver.stop()
+                self.retransmitter.stop()
+                self.socket.close()
+            else:
+                raise RuntimeError("Client did not give proper response to FIN")
 
 
 # Example how to start a start the timeout thread
