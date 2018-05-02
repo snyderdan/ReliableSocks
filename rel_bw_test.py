@@ -8,13 +8,11 @@
 
 import argparse
 import time
-import struct
 import hashlib
 import os
 import sys
 import binascii
 import sock352
-import cProfile
 
 
 def main():
@@ -170,4 +168,4 @@ def main():
 
 # create a main function in Python
 if __name__ == "__main__":
-    print(cProfile.run("main()"))
+    main()

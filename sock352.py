@@ -188,7 +188,7 @@ class Receiver(threading.Thread):
     def get_data(self, nbytes):
         while len(self.data_buffer) == 0:
             # sleep while we wait for data to fill buffer
-            time.sleep(0.05)
+            pass
 
         dbg_print(10, "full buffer: %s" % str(self.data_buffer))
         data = self.data_buffer.popleft()
@@ -200,7 +200,7 @@ class Receiver(threading.Thread):
 
     def stop(self):
         while len(self.outstanding) > 0:
-            time.sleep(0.05)
+            pass
         self.running = False
 
     def run(self):
