@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python2
 
 # Reliability client for CS 352
 # (c) 2018, R. P. Martin, under GPL Version 2
@@ -9,11 +9,12 @@
 import argparse
 import time
 import struct
-import md5
+import hashlib
 import os
 import sys
 import binascii
 import sock352
+import cProfile
 
 
 def main():
@@ -69,8 +70,8 @@ def main():
     dest_addr = (destinationIP, int(remote_port))
 
     # use the MD5 hash algorithm to validate all the data is correct
-    mdhash_sent = md5.new()
-    mdhash_recv = md5.new()
+    mdhash_sent = hashlib.md5()
+    mdhash_recv = hashlib.md5()
     # a lines of lines to echo back
 
     # for each line, take a time-stamp, send and recive the line, update the list of RTT times,
@@ -129,7 +130,7 @@ def main():
             bytes_to_receive = bytes_to_receive - len(recv_data)
             mdhash_recv.update(recv_data)
 
-    print " "
+    print(" ")
     digest_sent = mdhash_sent.digest()
     digest_recv = mdhash_recv.digest()
 
@@ -141,24 +142,25 @@ def main():
     lapsed_seconds = float(end_stamp - start_stamp)
     fd.close()
 
-    print "rel: sent digest: x%s received digest x%s remote digest x%s " % (
-    binascii.hexlify(digest_sent), binascii.hexlify(digest_recv), binascii.hexlify(remote_digest))
+    print("rel: sent digest: x%s received digest x%s remote digest x%s " % (
+    binascii.hexlify(digest_sent), binascii.hexlify(digest_recv), binascii.hexlify(remote_digest)))
 
     # this part send the lenght of the digest, then the
     # digest. It will be check on the server
 
     # compute bandwidthstatisticis
     total_time = end_stamp - start_stamp
+    print(total_time)
 
     bandwidth = (float(total_bytes) / total_time) / 1000000.0
 
     # make sure the digest from the remote side matches what we sent
-    failed = False;
+    failed = False
     for i, sent_byte in enumerate(digest_sent):
         remote_byte = remote_digest[i]
         if (sent_byte != remote_byte):
             print("%s: digest failed at byte %d diff: %c %c " % (prog_name, i, sent_byte, remote_byte))
-            failed = True;
+            failed = True
     if (not failed):
         print("%s: digest succeeded bandwidth %f Mbytes/sec" % (prog_name, bandwidth))
 
@@ -168,4 +170,4 @@ def main():
 
 # create a main function in Python
 if __name__ == "__main__":
-    main()
+    print(cProfile.run("main()"))

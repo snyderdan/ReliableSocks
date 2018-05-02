@@ -8,16 +8,13 @@
 # Note that simultaneous close() is required, does not support half-open connections ---
 # that is outstanding data if one side closes a connection and continues to send data,
 # or if one side does not close a connection the protocol will fail.
-
+import heapq
 import socket as ip
 import random
 import binascii
 import threading
 import time
-import sys
 import struct as st
-import os
-import signal
 
 # The first byte of every packet must have this value
 from collections import deque
@@ -55,10 +52,8 @@ STATE_REMOTE_CLOSED = 8
 # highly recommended
 def dbg_print(level, string):
     global sock352_dbg_level
-    if (sock352_dbg_level >= level):
-        print string
-    return
-
+    if sock352_dbg_level >= level:
+        print(string)
 
 # this is the thread object that re-transmits the packets
 class sock352Thread(threading.Thread):
@@ -173,6 +168,9 @@ class Packet:
             "%x%x%x%x%xx%s" % (self.type, self.cntl, self.seq, self.ack, self.size, binascii.hexlify(self.data)))
         return retstr
 
+    def __cmp__(self, other):
+        return cmp(self.seq, other.seq)
+
 
 class Receiver(threading.Thread):
     """This class handles receiving all packets, sending ACKs back, and handling FIN packets"""
@@ -223,23 +221,19 @@ class Receiver(threading.Thread):
             # must be a DATA packet
             else:
                 dbg_print(10, "Got data in packet: %s" % packet.data)
-                i = len(self.packet_queue) - 1
-                # otherwise, we must iterate through the list to find the correct index
-                while i >= 0:
-                    # find packet with a greater sequence number -- we need to go before that one
-                    if packet.seq < self.packet_queue[i].seq:
-                        break
-                    i = i - 1
-                # do insertion
-                self.packet_queue.insert(i+1, packet)
-                # send ack packet
+                # push packet onto heap
+                heapq.heappush(self.packet_queue, packet)
+                # send ack packet for the received packet
                 ackpack = Packet()
                 ackpack.cntl = ACK
                 ackpack.ack = packet.seq
                 self.connection.sendto(ackpack.pack(), address)
 
-            while len(self.packet_queue) > 0 and self.packet_queue[-1].seq == self.next_seq:
-                self.data_buffer.append(self.packet_queue.pop().data)
+            # go through packet queue
+            while len(self.packet_queue) > 0 and self.packet_queue[0].seq == self.next_seq:
+                # if the next sequential packet is available, add it's data to the data buffer
+                packet = heapq.heappop(self.packet_queue)
+                self.data_buffer.append(packet.data)
                 self.next_seq += 1
 
 
