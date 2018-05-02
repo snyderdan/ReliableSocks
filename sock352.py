@@ -61,6 +61,7 @@ def dbg_print(level, string):
 class Packet:
     def __init__(self):
         self.sender = None
+        self.time_sent = None
         self.type = MESSAGE_TYPE  # ID of sock352 packet
         self.cntl = 0  # control bits/flags
         self.seq = 0  # sequence number
@@ -136,10 +137,13 @@ class Packet:
             raise RuntimeError("Invalid type '%s' to compare to Packet" % str(type(other)))
 
 
+outstanding_lock = threading.Lock()
+
+
 class Receiver(threading.Thread):
     """This class handles receiving all packets, handling ACKs, sending ACKs,
     and passing data and FIN packets to the socket class."""
-    def __init__(self, connection, outstanding):
+    def __init__(self, connection, outstanding, timediffs, dropprob):
         threading.Thread.__init__(self)
         self.daemon = True
         self.packet_queue = []
@@ -147,6 +151,8 @@ class Receiver(threading.Thread):
         self.next_seq = 0
         self.running = False
         self.outstanding = outstanding
+        self.timediffs = timediffs
+        self.dropprob = dropprob
 
     def get_packet(self):
         while len(self.packet_queue) == 0 or self.packet_queue[0].seq != self.next_seq:
@@ -171,85 +177,66 @@ class Receiver(threading.Thread):
             dbg_print(10, "Got %d" % packet.seq)
             # if the packet is an ACK
             if packet.cntl == ACK:
-                # remove the outstanding packet from the outstanding set
-                self.outstanding.remove(packet.ack)
+                # remove the outstanding packet from outstanding and log time to acknowledgement
+                outstanding_lock.acquire()
+                try:
+                    acked = self.outstanding.pop(packet.ack)
+                    self.timediffs.append(time.clock() - acked.time_sent)
+                except Exception:
+                    # do nothing if we already got an ACK for this packet
+                    pass
+                outstanding_lock.release()
             # must be a DATA or FIN packet -- processed by socket
             else:
                 if packet.cntl == DATA:
                     dbg_print(10, "Got data in packet: %s" % packet.data)
-                # push packet onto heap
-                heapq.heappush(self.packet_queue, packet)
-                # send ack packet for the received packet
-                ackpack = Packet()
-                ackpack.cntl = ACK
-                ackpack.ack = packet.seq
-                self.connection.sendto(ackpack.pack(), address)
+                if packet.seq >= self.next_seq:
+                    # push packet onto heap unless we have already processed the packet
+                    heapq.heappush(self.packet_queue, packet)
+                else:
+                    print("Already saw: %d" % packet.seq)
+
+                # send ack packet for the received packet, even if we've seen it already
+                # they may not have gotten the last ACK for it.
+                if random.random() > self.dropprob:
+                    ackpack = Packet()
+                    ackpack.cntl = ACK
+                    ackpack.ack = packet.seq
+                    self.connection.sendto(ackpack.pack(), address)
 
 
-class Transmitter(threading.Thread):
-    """This class handles sending packets reliably. If it detects a packet has not made it, it retransmits it."""
-
-    def __init__(self, connection, outstanding):
+class Retransmitter(threading.Thread):
+    def __init__(self, connection, outstanding, timediffs, dropprob, address):
         threading.Thread.__init__(self)
         self.daemon = True
-        self.packet_queue = []
-        self.data_buffer = deque()
-        self.data_buffer_lock = threading.Lock()
         self.connection = connection
-        self.next_seq = 0
-        self.running = False
         self.outstanding = outstanding
-
-    def get_data(self, nbytes):
-        while len(self.data_buffer) == 0:
-            # sleep while we wait for data to fill buffer
-            pass
-
-        dbg_print(10, "full buffer: %s" % str(self.data_buffer))
-        data = self.data_buffer.popleft()
-        if len(data) > nbytes:
-            data, remaining = data[:nbytes], data[nbytes:]
-            self.data_buffer.appendleft(remaining)
-            dbg_print(10, "returning data: %s" % data)
-        return data
+        self.timediffs = timediffs
+        self.dropprob = dropprob
+        self.running = False
+        self.address = address
 
     def stop(self):
-        while len(self.outstanding) > 0:
-            pass
         self.running = False
 
     def run(self):
         self.running = True
         while self.running:
-            raw_data, address = self.connection.recvfrom(MAX_PKT)
-            packet = Packet()
-            packet.sender = address
-            packet.unpack(raw_data)
-            dbg_print(10, "Got %d" % packet.seq)
-            # if the packet is an ACK
-            if packet.cntl == ACK:
-                # remove the outstanding packet from the outstanding set
-                self.outstanding.remove(packet.ack)
-            # if it's a FIN packet
-            elif packet.cntl & FIN == FIN:
-                pass
-            # must be a DATA packet
-            else:
-                dbg_print(10, "Got data in packet: %s" % packet.data)
-                # push packet onto heap
-                heapq.heappush(self.packet_queue, packet)
-                # send ack packet for the received packet
-                ackpack = Packet()
-                ackpack.cntl = ACK
-                ackpack.ack = packet.seq
-                self.connection.sendto(ackpack.pack(), address)
+            # run every 20ms
+            time.sleep(0.02)
+            cnt = len(self.timediffs)
+            if cnt == 0:
+                continue
 
-            # go through packet queue
-            while len(self.packet_queue) > 0 and self.packet_queue[0].seq == self.next_seq:
-                # if the next sequential packet is available, add it's data to the data buffer
-                packet = heapq.heappop(self.packet_queue)
-                self.data_buffer.append(packet.data)
-                self.next_seq += 1
+            avg = sum(self.timediffs[:cnt]) / cnt
+            outstanding_lock.acquire()
+            for pkt in self.outstanding.values():
+                if (time.clock() - pkt.time_sent) > 10 * avg:
+                    # resend packet if it's 10 times above average for ACKs
+                    pkt.time_sent = time.clock()
+                    print("sending %d again to %s" % (pkt.seq, str(self.address)))
+                    self.connection.sendto(pkt.pack(), self.address)
+            outstanding_lock.release()
 
 
 class Socket:
@@ -259,11 +246,13 @@ class Socket:
         self.debug_level = 0
         self.drop_prob = 0
         self.target_address = None
-        self.outstanding = set()
+        self.outstanding = dict()
+        self.timediffs = []
         self.data_buffer = ""
         self.sequence = random.randint(0, 10000)
         self.seed = None
         self.receiver = None
+        self.retransmitter = None
 
     def next_sequence(self):
         self.sequence += 1
@@ -297,7 +286,7 @@ class Socket:
     def bind(self, address):
         # AF_INET is for internet, and SOCK_DGRAM indicates UDP
         self.socket = ip.socket(ip.AF_INET, ip.SOCK_DGRAM)
-        self.receiver = Receiver(self.socket, self.outstanding)
+        self.receiver = Receiver(self.socket, self.outstanding, self.timediffs, self.drop_prob)
         # bind to address
         self.socket.bind(address)
 
@@ -322,9 +311,12 @@ class Socket:
             # raise an error if the server did not accept our sync
             raise RuntimeError("Did not receive an acknowledgement to SYNC packet")
         # start receiver thread with sequence number
-        self.receiver = Receiver(self.socket, self.outstanding)
+        self.receiver = Receiver(self.socket, self.outstanding, self.timediffs, self.drop_prob)
+        self.retransmitter = Retransmitter(self.socket, self.outstanding, self.timediffs, self.drop_prob,
+                                           self.target_address)
         self.receiver.next_seq = packet.seq + 1
         self.receiver.start()
+        self.retransmitter.start()
 
     def accept(self):
         # wait for SYNC packet
@@ -345,25 +337,28 @@ class Socket:
         ackpack.ack = packet.seq
         # send ACK SYNC packet
         self.socket.sendto(ackpack.pack(), self.target_address)
+        self.retransmitter = Retransmitter(self.socket, self.outstanding, self.timediffs, self.drop_prob,
+                                           self.target_address)
         # start receiver now that we have an address and a sequence number to start
         self.receiver.next_seq = packet.seq + 1
         self.receiver.start()
+        self.retransmitter.start()
         return address
 
         # send a message up to MAX_DATA
 
     # You must implement this method
     def sendto(self, buffer):
+        # create packet to send
+        packet = Packet()
+        packet.cntl = DATA
+        packet.seq = self.next_sequence()
+        packet.data = buffer
+        packet.time_sent = time.clock()
+        # add it to the outstanding set
+        self.outstanding[packet.seq] = packet
         # so...what if no one implements dropping packets?
-        # read: someone's not going to implement dropping packets
         if random.random() > self.drop_prob:
-            # create packet to send
-            packet = Packet()
-            packet.cntl = DATA
-            packet.seq = self.next_sequence()
-            packet.data = buffer
-            # add it to the outstanding set
-            self.outstanding.add(packet)
             dbg_print(10, "Sending %d" % packet.seq)
             # actually send packet
             self.socket.sendto(packet.pack(), self.target_address)
@@ -396,6 +391,7 @@ class Socket:
     # You must implement this method
     def close(self):
         self.receiver.stop()
+        self.retransmitter.stop()
         self.socket.close()
 
 
