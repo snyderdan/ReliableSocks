@@ -175,33 +175,34 @@ class Packet:
 
 
 class Receiver(threading.Thread):
-    """This class is designed to return packets in order. It also processes ACKs and removes them from the
-    outstanding list. It does not, however, handle syncs or FIN packets."""
+    """This class handles receiving all packets, sending ACKs back, and handling FIN packets"""
     def __init__(self, connection, outstanding):
         threading.Thread.__init__(self)
         self.daemon = True
-        self.packet_queue = deque()
+        self.packet_queue = []
+        self.data_buffer = deque()
+        self.data_buffer_lock = threading.Lock()
         self.connection = connection
         self.next_seq = 0
         self.running = False
         self.outstanding = outstanding
 
-    def get_packet(self):
-        packet = None
-        while len(self.packet_queue) == 0:
-            # sleep 50ms waiting for a packet
+    def get_data(self, nbytes):
+        while len(self.data_buffer) == 0:
+            # sleep while we wait for data to fill buffer
             time.sleep(0.05)
 
-        # now we know we have at least 1 valid packet received
-        while self.packet_queue[0].seq != self.next_seq:
-            # wait until we find the packet we're looking for
-            time.sleep(0.05)
-
-        packet = self.packet_queue.popleft()
-        self.next_seq = packet.seq + 1
-        return packet.data
+        dbg_print(10, "full buffer: %s" % str(self.data_buffer))
+        data = self.data_buffer.popleft()
+        if len(data) > nbytes:
+            data, remaining = data[:nbytes], data[nbytes:]
+            self.data_buffer.appendleft(remaining)
+            dbg_print(10, "returning data: %s" % data)
+        return data
 
     def stop(self):
+        while len(self.outstanding) > 0:
+            time.sleep(0.05)
         self.running = False
 
     def run(self):
@@ -211,29 +212,39 @@ class Receiver(threading.Thread):
             packet = Packet()
             packet.sender = address
             packet.unpack(raw_data)
+            dbg_print(10, "Got %d" % packet.seq)
             # if the packet is an ACK
             if packet.cntl == ACK:
                 # remove the outstanding packet from the outstanding set
                 self.outstanding.remove(packet.ack)
-                continue
-            # if it was not an ACK it must be a data or a FIN packet -- these are processed by the socket
-            if len(self.packet_queue) == 0 or self.packet_queue[-1].seq < packet.seq:
-                # if this packet belongs at the end, place it there
-                self.packet_queue.append(packet)
+            # if it's a FIN packet
+            elif packet.cntl & FIN == FIN:
+                pass
+            # must be a DATA packet
             else:
-                i = 0
+                dbg_print(10, "Got data in packet: %s" % packet.data)
+                i = len(self.packet_queue) - 1
                 # otherwise, we must iterate through the list to find the correct index
-                for i in range(len(self.packet_queue)):
+                while i >= 0:
                     # find packet with a greater sequence number -- we need to go before that one
-                    if self.packet_queue[i].seq > packet.seq:
+                    if packet.seq < self.packet_queue[i].seq:
                         break
+                    i = i - 1
                 # do insertion
-                self.packet_queue.insert(i, packet)
-            # send ACK packet
+                self.packet_queue.insert(i+1, packet)
+                # send ack packet
+                ackpack = Packet()
+                ackpack.cntl = ACK
+                ackpack.ack = packet.seq
+                self.connection.sendto(ackpack.pack(), address)
+
+            while len(self.packet_queue) > 0 and self.packet_queue[-1].seq == self.next_seq:
+                self.data_buffer.append(self.packet_queue.pop().data)
+                self.next_seq += 1
 
 
 
-# the main socket class
+        # the main socket class
 # you must fill in all the methods
 # it must work against the class client and servers
 # with various drop rates
@@ -336,21 +347,22 @@ class Socket:
             packet.seq = self.sequence
             packet.data = buffer
             self.sequence += 1
-            self.outstanding.add(packet)
+            self.outstanding.add(packet.seq)
+            dbg_print(10, "Sending %d" % packet.seq)
             self.socket.sendto(packet.pack(), self.target_address)
 
         # receive a message up to MAX_DATA
 
     # You must implement this method
     def recvfrom(self, nbytes):
-        return self.receiver.get_packet()
+        return self.receiver.get_data(nbytes)
 
     # close the socket and make sure all outstanding
     # data is delivered
     # You must implement this method
     def close(self):
-        self.socket.close()
         self.receiver.stop()
+        self.socket.close()
 
 
 # Example how to start a start the timeout thread
