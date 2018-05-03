@@ -259,7 +259,7 @@ class Socket(threading.Thread):
             ackpack.cntl = ACK
             ackpack.ack = packet.seq
             dbg_print(9, "Sending ack for %x" % packet.seq)
-            self.transmitter.send(ackpack, self.drop_prob)
+            self.transmitter.transmit(ackpack, self.drop_prob)
 
         elif packet.cntl == ACK:
             dbg_print(9, "Got ack %x" % packet.ack)
@@ -302,9 +302,7 @@ class Socket(threading.Thread):
         # we end up here after receiving a FIN packet
         while len(self.outstanding) > 0:
             # while there are still outstanding packets, handle them
-            print(self.outstanding)
             self._handle_outstanding()
-            time.sleep(1)
         # transmit FIN ACK packet
         finpack = Packet()
         finpack.cntl = FIN | ACK
@@ -314,24 +312,36 @@ class Socket(threading.Thread):
         self.socket.shutdown(ip.SHUT_RDWR)
         self.socket.close()
 
-    def get_sequential_packet(self):
+    # _data_wait and _sequence_check separated from get_sequential_packet for ease of profiling
+    def _data_wait(self):
+        start_wait = time.clock()
         while self.running and len(self.packet_heap) == 0:
             # wait while there aren't any packets to read, and we can still receive packets
             pass
+        # print(time.clock() - start_wait)
 
+    def _sequence_check(self):
+        while self.packet_heap[0].seq != self.next_sequential:
+            # wait until the next sequential packet is available
+            pass
+            # print("%x, %x" % (self.next_sequential, self.packet_heap[0].seq))
+            # if self.next_sequential in self.received_seqs:
+                # if the next sequence has been received but is not on the heap, it must have been an ACK
+            #    self.next_sequential += 1
+            # time.sleep(1)
+
+    def get_sequential_packet(self):
+        self._data_wait()
         if not self.running and len(self.packet_heap) == 0:
             # if the thread is no longer alive, we know that all outstanding data is settled by both parties
             # if there aren't anymore packets on the heap, then we're done
             return None
 
-        while self.packet_heap[0].seq != self.next_sequential:
-            # wait until the next sequential packet is available
-            if self.next_sequential in self.received_seqs:
-                # if the next sequence has been received but is not on the heap, it must have been an ACK
-                self.next_sequential += 1
+        self._sequence_check()
 
         self.next_sequential += 1
-        return heapq.heappop(self.packet_heap)
+        packet = heapq.heappop(self.packet_heap)
+        return packet
 
     def set_debug_level(self, level):
         global sock352_dbg_level
@@ -358,6 +368,7 @@ class Socket(threading.Thread):
         self.transmitter = Transmitter(address, self.socket)
         self.receiver = Receiver(self)
         self.receiver.start()
+        self.running = True
         self.start()
         # create SYNC packet to send to server
         syncpack = Packet()
