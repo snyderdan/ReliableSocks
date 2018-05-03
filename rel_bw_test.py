@@ -164,9 +164,10 @@ def main():
         print("%s: digest succeeded bandwidth %f Mbytes/sec" % (prog_name, bandwidth))
 
     # this makes sure all threads exit
-    os._exit(1)
+    # os._exit(1)
 
 
 # create a main function in Python
 if __name__ == "__main__":
-    cProfile.run("main()")
+    main()
+    #cProfile.run("main()")

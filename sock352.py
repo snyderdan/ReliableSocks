@@ -72,7 +72,7 @@ class Average:
 
     def get(self):
         if len(self.samples) == 0:
-            return 500
+            return 0
         return self.total / len(self.samples)
 
 
@@ -103,7 +103,7 @@ class Packet:
             self.size = values[4]
             self.data = values[5]
             # you dont have to have to implement the the dbg_print function, but its highly recommended
-            dbg_print(1, ("sock352: unpacked:0x%x cntl:0x%x seq:0x%x ack:0x%x size:0x%x data:x%s" % (
+            dbg_print(10, ("sock352: unpacked:0x%x cntl:0x%x seq:0x%x ack:0x%x size:0x%x data:x%s" % (
                 self.type, self.cntl, self.seq, self.ack, self.size, binascii.hexlify(self.data))))
         else:
             dbg_print(2, (
@@ -192,26 +192,17 @@ class Transmitter:
 
 
 class Receiver(threading.Thread):
-    """This class strictly receives packets and queues them in the order it receives them.
-       ALL packets should be received through this class.
+    """This class strictly receives packets and passes them to the Socket class for processing.
+       ALL packets should be received via this class.
     """
 
-    def __init__(self, connection):
+    def __init__(self, owner_sock):
         threading.Thread.__init__(self)
         self.daemon = True
         self.running = False
         self.packet_queue = deque()
-        self.connection = connection
-
-    def has_packet(self):
-        return len(self.packet_queue) > 0
-
-    def get_packet(self):
-        while len(self.packet_queue) == 0:
-            # wait for next packet in sequence
-            pass
-        # return most recent packet
-        return self.packet_queue.popleft()
+        self.connection = owner_sock.socket
+        self.owner = owner_sock
 
     def stop(self):
         self.running = False
@@ -225,7 +216,7 @@ class Receiver(threading.Thread):
             packet = Packet()
             packet.sender = address
             packet.unpack(raw_data)
-            self.packet_queue.append(packet)
+            self.owner.process_packet(packet)
 
 
 class Socket(threading.Thread):
@@ -247,11 +238,17 @@ class Socket(threading.Thread):
         self.packet_heap = list()
         self.next_sequential = 0
         self.received_seqs = set()
+        self.finish_sequence = None
         self.avg_response = Average()
 
-    def _process_packet(self, packet):
+    def process_packet(self, packet):
         """Processes a received packet"""
-        if packet.cntl == DATA:
+        if packet.cntl & SYN == SYN:
+            # if it's a sync packet, place it on the heap with no ACK
+            heapq.heappush(self.packet_heap, packet)
+            self.next_sequential = packet.seq
+
+        elif packet.cntl == DATA:
             if packet.seq not in self.received_seqs:
                 # if we have not received it before, add it to the heap
                 heapq.heappush(self.packet_heap, packet)
@@ -270,31 +267,26 @@ class Socket(threading.Thread):
             if packet.ack in self.outstanding:
                 # if this is an ACK for an outstanding packet, remove the outstanding packet
                 dbg_print(9, "Removing %x from outstanding" % packet.ack)
-                self.outstanding.pop(packet.ack)
+                pkt = self.outstanding.pop(packet.ack)
+                self.avg_response.adjust(time.clock() - pkt.time_sent)
             self.received_seqs.add(packet.seq)
 
         elif packet.cntl & FIN == FIN:
-            # we received a FIN -- we need to clear outstanding buffer
-            while len(self.outstanding) > 0:
-                while self.receiver.has_packet():
-                    # iterate through available packets and process them
-                    pkt = self.receiver.get_packet()
-                    self._process_packet(pkt)
-                # handle outstanding packets
-                self._handle_outstanding()
-            # stop running
+            # we received a FIN -- stop running
+            print("Got fin")
+            self.finish_sequence = packet.seq
             self.running = False
-            # transmit FIN ACK packet
-            finpack = Packet()
-            finpack.cntl = FIN | ACK
-            finpack.ack = packet.seq
-            self.transmitter.send(finpack)
 
         else:
             raise RuntimeError("Bad packet cntl field: 0x%x" % packet.cntl)
 
     def _handle_outstanding(self):
-        threshold = self.avg_response.get() * 10  # threshold is 10 times average
+        average = self.avg_response.get()
+        threshold = average * 10  # threshold is 10 times average
+        if average == 0:
+            # if there is no average, default to 500ms
+            threshold = 0.5
+
         for pkt in self.outstanding.values():
             if (time.clock() - pkt.time_sent) > threshold:
                 # use transmit since sequence number is already set
@@ -304,16 +296,23 @@ class Socket(threading.Thread):
     def run(self):
         self.running = True
         while self.running:
-            # run every ~10ms
-            time.sleep(0.01)
-
-            while self.receiver.has_packet():
-                # iterate through available packets and process them
-                packet = self.receiver.get_packet()
-                self._process_packet(packet)
-
+            time.sleep(0.02)
             # handle any outstanding packets
             self._handle_outstanding()
+        # we end up here after receiving a FIN packet
+        while len(self.outstanding) > 0:
+            # while there are still outstanding packets, handle them
+            print(self.outstanding)
+            self._handle_outstanding()
+            time.sleep(1)
+        # transmit FIN ACK packet
+        finpack = Packet()
+        finpack.cntl = FIN | ACK
+        finpack.ack = self.finish_sequence
+        self.transmitter.send(finpack)
+        self.receiver.stop()
+        self.socket.shutdown(ip.SHUT_RDWR)
+        self.socket.close()
 
     def get_sequential_packet(self):
         while self.running and len(self.packet_heap) == 0:
@@ -357,28 +356,28 @@ class Socket(threading.Thread):
         self.socket = ip.socket(ip.AF_INET, ip.SOCK_DGRAM)
         # create transmitter and receiver objects
         self.transmitter = Transmitter(address, self.socket)
-        self.receiver = Receiver(self.socket)
+        self.receiver = Receiver(self)
         self.receiver.start()
+        self.start()
         # create SYNC packet to send to server
         syncpack = Packet()
         syncpack.cntl = SYN
         # send packet
         self.transmitter.send(syncpack)
         # now we must wait for a SYNC ACK response
-        packet = self.receiver.get_packet()
+        packet = self.get_sequential_packet()
 
         if packet.cntl != (SYN | ACK) or packet.ack != syncpack.seq:
             # raise an error if the server did not accept our sync
             raise RuntimeError("Did not receive an acknowledgement to SYNC packet")
         # otherwise, we're established
-        self.next_sequential = packet.seq + 1
-        self.start()
 
     def accept(self):
         # create new receiver and begin listening for new connection
-        self.receiver = Receiver(self.socket)
+        self.receiver = Receiver(self)
         self.receiver.start()
-        packet = self.receiver.get_packet()
+        self.running = True
+        packet = self.get_sequential_packet()
 
         if packet.cntl != SYN:
             # raise error if it is not a sync packet
@@ -386,7 +385,6 @@ class Socket(threading.Thread):
 
         # create transmitter now that we have address and set next sequential packet number
         self.transmitter = Transmitter(packet.sender, self.socket)
-        self.next_sequential = packet.seq + 1
         # start socket reliability thread now that we have both a transmitter and receiver
         self.start()
 
@@ -428,15 +426,19 @@ class Socket(threading.Thread):
     def close(self):
         while len(self.outstanding) > 0:
             # clear outstanding buffer
-            for v in self.outstanding.values():
-                dbg_print(9, "Seq: %x" % v.seq)
-            time.sleep(1)
+            pass
 
         # create FIN packet
         finpack = Packet()
         finpack.cntl = FIN
-        # transmit to other end -- threads will terminate gracefully
+        # transmit to other end
         self.transmitter.send(finpack)
+
+        while self.running:
+            # we will continue to run until we receive a FIN packet
+            # since we cleared the outstanding queue already, we don't have to worry about the main thread taking down
+            # the socket after it receives a FIN packet and exits the main loop
+            pass
 
 
 # Example how to start a start the timeout thread
