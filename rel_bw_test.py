@@ -7,6 +7,7 @@
 # server, and makes sure the MD5 checksum of all the lines sent matches the lines received
 
 import argparse
+import cProfile
 import time
 import hashlib
 import os
@@ -168,4 +169,4 @@ def main():
 
 # create a main function in Python
 if __name__ == "__main__":
-    main()
+    cProfile.run("main()")
